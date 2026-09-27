@@ -1,0 +1,5 @@
+server.exe
+server.exe.*
+server.new.exe
+*.log
+state/
