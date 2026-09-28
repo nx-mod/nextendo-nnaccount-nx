@@ -403,6 +403,29 @@ func (s *service) authorize(w http.ResponseWriter, r *http.Request) {
 	if clientID == "" {
 		clientID = systemClient
 	}
+	// A silent OAuth request (nnAccount, prompt=none, e.g. NxELicense's response_type "code id_token" to
+	// nintendo://e-license.nx.sys) wants the standard redirect: the grant in the redirect URI's fragment
+	// (query for a plain code), not JSON. Answering JSON left the page the console was opening blank.
+	if redirect := f.Get("redirect_uri"); redirect != "" && f.Get("response_type") != "" {
+		rt := f.Get("response_type")
+		v := url.Values{}
+		if strings.Contains(rt, "code") {
+			v.Set("code", s.newCode(naID))
+		}
+		if strings.Contains(rt, "id_token") {
+			v.Set("id_token", s.idToken(naID, clientID, strings.TrimSpace(f.Get("nonce"))))
+		}
+		if st := strings.TrimSpace(f.Get("state")); st != "" {
+			v.Set("state", st)
+		}
+		sep := "#"
+		if rt == "code" && f.Get("response_mode") != "fragment" {
+			sep = "?"
+		}
+		log.Printf("[nnaccount] authorize: %s for client %s -> redirect to %s", rt, clientID, redirect)
+		http.Redirect(w, r, redirect+sep+v.Encode(), http.StatusFound)
+		return
+	}
 	resp := map[string]any{"id_token": s.idToken(naID, clientID, f.Get("nonce")), "expires_in": int(idTokenTTL.Seconds()), "token_type": "Bearer"}
 	if st := f.Get("state"); st != "" {
 		resp["state"] = st
