@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -27,6 +28,11 @@ import (
 	"encoding/pem"
 	"fmt"
 	"html/template"
+	"image"
+	"image/color"
+	"image/draw"
+	_ "image/jpeg"
+	"image/png"
 	"io"
 	"log"
 	"math/big"
@@ -41,13 +47,13 @@ import (
 )
 
 const (
-	issuer        = "https://accounts.nintendo.com"
-	jku           = "https://accounts.nintendo.com/1.0.0/certificates"
-	keyID         = "nextendo-nnaccount-1"
-	accessTTL     = 900 * time.Second
-	idTokenTTL    = 900 * time.Second
-	refreshTTL    = 365 * 24 * time.Hour
-	systemClient  = "6ffd70c434d303c8" // nnAccount's own client id (the console's "aud")
+	issuer       = "https://accounts.nintendo.com"
+	jku          = "https://accounts.nintendo.com/1.0.0/certificates"
+	keyID        = "nextendo-nnaccount-1"
+	accessTTL    = 900 * time.Second
+	idTokenTTL   = 900 * time.Second
+	refreshTTL   = 365 * 24 * time.Hour
+	systemClient = "6ffd70c434d303c8" // nnAccount's own client id (the console's "aud")
 )
 
 // The scope list production returned with every access token.
@@ -68,8 +74,9 @@ type service struct {
 	defaultPID  uint64
 	dataDir     string
 
-	mu    sync.Mutex
-	links map[string]uint64 // Nintendo Account id -> Nextendo PID
+	mu     sync.Mutex
+	links  map[string]uint64 // Nintendo Account id -> Nextendo PID
+	emails map[string]string // Nintendo Account id -> the e-mail it signed in with (users/me)
 }
 
 // ---------------------------------------------------------------- keys and tokens
@@ -179,16 +186,24 @@ func (s *service) identity(pid uint64) (*identity, error) {
 
 func (s *service) linksPath() string { return filepath.Join(s.dataDir, "links.json") }
 
+func (s *service) emailsPath() string { return filepath.Join(s.dataDir, "emails.json") }
+
 func (s *service) loadLinks() {
 	s.links = map[string]uint64{}
 	if b, err := os.ReadFile(s.linksPath()); err == nil {
 		json.Unmarshal(b, &s.links)
+	}
+	s.emails = map[string]string{}
+	if b, err := os.ReadFile(s.emailsPath()); err == nil {
+		json.Unmarshal(b, &s.emails)
 	}
 }
 
 func (s *service) saveLinksLocked() {
 	b, _ := json.MarshalIndent(s.links, "", "  ")
 	os.WriteFile(s.linksPath(), b, 0o600)
+	b, _ = json.MarshalIndent(s.emails, "", "  ")
+	os.WriteFile(s.emailsPath(), b, 0o600)
 }
 
 // pidFor maps a Nintendo Account id to a Nextendo PID: a known link, or the default account (recorded
@@ -420,6 +435,7 @@ func (s *service) login(email, password string) (string, uint64, error) {
 	}
 	s.mu.Lock()
 	s.links[naID] = id.PID
+	s.emails[naID] = email
 	s.saveLinksLocked()
 	s.mu.Unlock()
 	return naID, id.PID, nil
@@ -528,7 +544,8 @@ func (s *service) tokenSet(w http.ResponseWriter, naID, clientID string) {
 		"access_token": s.accessToken(naID, clientID), "refresh_token": s.refreshToken(naID, clientID),
 		"id_token": s.sign(map[string]any{"aud": clientID, "exp": now + int64(idTokenTTL.Seconds()), "iat": now,
 			"iss": issuer, "jti": newJTI(), "sub": naID, "typ": "id_token"}),
-		"expires_in": int(accessTTL.Seconds()), "scope": accessScopes, "token_type": "Bearer",
+		"session_token": s.refreshToken(naID, clientID),
+		"expires_in":    int(accessTTL.Seconds()), "scope": accessScopes, "token_type": "Bearer",
 	})
 }
 
@@ -557,15 +574,79 @@ func (s *service) usersMe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"errorCode": "internal_server_error"})
 		return
 	}
-	created := time.Unix(1716149960, 0).Unix()
+	s.mu.Lock()
+	email := s.emails[naID]
+	s.mu.Unlock()
+	if email == "" {
+		email = naID + "@nextendo.local"
+	}
+	// Every field production sends, in its types: nnAccount rejects a profile that lacks one (the link then ends
+	// in a server error), and fetches iconUri right after.
+	const created = int64(1716149960)
+	updated := created
+	if id.ImageUpdatedAt > updated {
+		updated = id.ImageUpdatedAt
+	}
+	perm := func(permitted bool) map[string]any {
+		return map[string]any{"editable": map[string]any{"admin": false, "self": true}, "permitted": permitted,
+			"updatedAt": created, "userConfirmed": true}
+	}
+	optIn := map[string]any{"optedIn": false, "updatedAt": created}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id": naID, "nickname": id.Nickname, "screenName": id.Nickname + "@nextendo", "email": "",
-		"emailVerified": true, "emailOptedIn": false, "birthday": "1990-01-01", "gender": "unknown",
-		"country": "US", "region": nil, "language": "en-US", "timezone": map[string]any{"id": "America/New_York", "name": "America/New_York", "utcOffset": "-04:00", "utcOffsetSeconds": -14400},
-		"isChild": false, "analyticsOptedIn": false, "clientFriendsOptedIn": true,
-		"createdAt": created, "updatedAt": id.ImageUpdatedAt, "candidateMiis": []any{}, "mii": nil,
-		"links": map[string]any{}, "eachEmailOptedIn": map[string]any{},
+		"agreedTerms": map[string]any{
+			"EULA":          map[string]any{"agreedAt": created, "country": "US", "version": 2},
+			"privacyPolicy": map[string]any{"agreedAt": created, "country": "US", "version": 2},
+		},
+		"analyticsOptedIn": false, "analyticsOptedInUpdatedAt": created,
+		"analyticsPermissions": map[string]any{"dataCollection": perm(false), "internalAnalysis": perm(true),
+			"targetMarketing": perm(false)},
+		"birthday": "1990-01-01", "clientFriendsOptedIn": true, "clientFriendsOptedInUpdatedAt": created,
+		"country": "US", "createdAt": created,
+		"eachEmailOptedIn": map[string]any{"deals": optIn, "survey": optIn},
+		"email":            email, "emailOptedIn": false, "emailOptedInUpdatedAt": created, "emailVerified": true,
+		"gender": "unknown", "iconUri": "https://cdn.accounts.nintendo.com/icons/v1/" + naID + ".png",
+		"id": naID, "isChild": false, "language": "en-US", "links": map[string]any{}, "loginId": nil,
+		"nickname": id.Nickname, "phoneNumberEnabled": false, "region": nil, "screenName": maskEmail(email),
+		"termsAgreementRequired": false,
+		"timezone": map[string]any{"id": "America/New_York", "name": "America/New_York", "utcOffset": "-04:00",
+			"utcOffsetSeconds": -14400},
+		"updatedAt": updated,
 	})
+}
+
+// maskEmail is Nintendo's screenName: "nextendo@example.com" -> "ne•••@e••••".
+func maskEmail(email string) string {
+	user, domain, _ := strings.Cut(email, "@")
+	head := func(s string, n int) string {
+		r := []rune(s)
+		if len(r) > n {
+			r = r[:n]
+		}
+		return string(r)
+	}
+	return head(user, 2) + "•••@" + head(domain, 1) + "••••"
+}
+
+// GET /icons/v1/<Nintendo Account id>.png (cdn.accounts.nintendo.com) — the profile's iconUri: the Nextendo
+// account's avatar as a PNG, or a plain Nextendo-red square when it has none.
+func (s *service) icon(w http.ResponseWriter, r *http.Request) {
+	naID := strings.TrimSuffix(filepath.Base(r.URL.Path), ".png")
+	var img image.Image
+	if pid, ok := s.pidFor(naID); ok {
+		if id, err := s.identity(pid); err == nil && id.Avatar != "" {
+			if raw, err := base64.StdEncoding.DecodeString(id.Avatar); err == nil {
+				img, _, _ = image.Decode(bytes.NewReader(raw))
+			}
+		}
+	}
+	if img == nil {
+		m := image.NewRGBA(image.Rect(0, 0, 256, 256))
+		draw.Draw(m, m.Bounds(), &image.Uniform{color.RGBA{230, 0, 18, 255}}, image.Point{}, draw.Src)
+		img = m
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-cache")
+	png.Encode(w, img)
 }
 
 func main() {
@@ -591,6 +672,7 @@ func main() {
 	mux.HandleFunc("/connect/1.0.0/api/session_token", s.sessionToken)
 	mux.HandleFunc("/1.0.0/certificates", s.certificates)
 	mux.HandleFunc("/2.0.0/users/me", s.usersMe)
+	mux.HandleFunc("/icons/v1/", s.icon)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		log.Printf("[nnaccount] NOT HANDLED %s %s%s body=%s", r.Method, r.Host, r.URL.RequestURI(), redact(string(body)))
