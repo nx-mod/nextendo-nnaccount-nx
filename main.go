@@ -72,6 +72,7 @@ type service struct {
 	accountURL  string
 	internalKey string
 	defaultPID  uint64
+	localOpen   bool // NNACCOUNT_LOCAL_OPEN=1: an unknown Nintendo Account gets an account of its own
 	dataDir     string
 
 	mu     sync.Mutex
@@ -206,21 +207,51 @@ func (s *service) saveLinksLocked() {
 	os.WriteFile(s.emailsPath(), b, 0o600)
 }
 
-// pidFor maps a Nintendo Account id to a Nextendo PID: a known link, or the default account (recorded
-// as a link, so the mapping is stable and editable in links.json).
+// pidFor maps a Nintendo Account id to a Nextendo PID: a known link; else the default account; else, with
+// NNACCOUNT_LOCAL_OPEN=1, an account of its own from nextendo-account's local open mode (/api/nsa creates
+// one for an id nobody owns). A console linked elsewhere (production Nextendo) keeps working on the LAN stack
+// instead of asking to sign in again. The mapping is recorded in links.json, so it stays stable.
 func (s *service) pidFor(naID string) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if pid, ok := s.links[naID]; ok {
 		return pid, true
 	}
-	if s.defaultPID == 0 || naID == "" {
+	if naID == "" {
 		return 0, false
 	}
-	s.links[naID] = s.defaultPID
+	pid := s.defaultPID
+	if pid == 0 && s.localOpen {
+		pid = s.openAccountFor(naID)
+	}
+	if pid == 0 {
+		return 0, false
+	}
+	s.links[naID] = pid
 	s.saveLinksLocked()
-	log.Printf("[nnaccount] Nintendo Account %s linked to default PID %d (links.json)", naID, s.defaultPID)
-	return s.defaultPID, true
+	log.Printf("[nnaccount] Nintendo Account %s linked to PID %d (links.json)", naID, pid)
+	return pid, true
+}
+
+// openAccountFor asks nextendo-account's /api/nsa (local open mode) for the account of this id, creating it.
+func (s *service) openAccountFor(naID string) uint64 {
+	n, err := strconv.ParseUint(naID, 16, 64)
+	if err != nil || n == 0 {
+		return 0
+	}
+	resp, err := http.Get(s.accountURL + "/api/nsa?id=" + strconv.FormatUint(n, 10))
+	if err != nil {
+		log.Printf("[nnaccount] /api/nsa: %v", err)
+		return 0
+	}
+	defer resp.Body.Close()
+	var out struct {
+		PID uint64 `json:"pid"`
+	}
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&out) != nil {
+		return 0
+	}
+	return out.PID
 }
 
 // ---------------------------------------------------------------- handlers
@@ -652,6 +683,7 @@ func main() {
 		accountURL:  envOr("NNACCOUNT_ACCOUNT_URL", "http://127.0.0.1:8080"),
 		internalKey: os.Getenv("NEXTENDO_INTERNAL_KEY"),
 		dataDir:     envOr("NNACCOUNT_DATA", "."),
+		localOpen:   os.Getenv("NNACCOUNT_LOCAL_OPEN") == "1",
 	}
 	if v := os.Getenv("NNACCOUNT_DEFAULT_PID"); v != "" {
 		s.defaultPID, _ = strconv.ParseUint(v, 10, 64)
