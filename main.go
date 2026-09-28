@@ -279,6 +279,25 @@ func (s *service) accessToken(naID, clientID string) string {
 	})
 }
 
+// idToken is the account's OpenID token. nintendo.ai carries the Nextendo account's BaaS user id: BaaS
+// federation (linking or importing this Nintendo Account on a console) puts the console on that user.
+func (s *service) idToken(naID, clientID, nonce string) string {
+	now := time.Now().Unix()
+	claims := map[string]any{
+		"aud": clientID, "exp": now + int64(idTokenTTL.Seconds()), "iat": now, "iss": issuer,
+		"jti": newJTI(), "sub": naID, "typ": "id_token",
+	}
+	if nonce != "" {
+		claims["nonce"] = nonce
+	}
+	if pid, ok := s.pidFor(naID); ok {
+		if id, err := s.identity(pid); err == nil && id.BaasUserID != "" {
+			claims["nintendo"] = map[string]any{"ai": id.BaasUserID}
+		}
+	}
+	return s.sign(claims)
+}
+
 func (s *service) refreshToken(naID, clientID string) string {
 	now := time.Now().Unix()
 	return s.sign(map[string]any{
@@ -344,8 +363,7 @@ func (s *service) authorize(w http.ResponseWriter, r *http.Request) {
 			naID = claimString(jwtClaims(f.Get(k)), "sub")
 		}
 	}
-	pid, ok := s.pidFor(naID)
-	if !ok {
+	if _, ok := s.pidFor(naID); !ok {
 		log.Printf("[nnaccount] authorize: no account for Nintendo Account %q", naID)
 		oauthError(w, "access_denied", "unknown account")
 		return
@@ -354,18 +372,7 @@ func (s *service) authorize(w http.ResponseWriter, r *http.Request) {
 	if clientID == "" {
 		clientID = systemClient
 	}
-	now := time.Now().Unix()
-	claims := map[string]any{
-		"aud": clientID, "exp": now + int64(idTokenTTL.Seconds()), "iat": now, "iss": issuer,
-		"jti": newJTI(), "sub": naID, "typ": "id_token",
-	}
-	if n := f.Get("nonce"); n != "" {
-		claims["nonce"] = n
-	}
-	if id, err := s.identity(pid); err == nil {
-		claims["nintendo"] = map[string]any{"ai": id.BaasUserID}
-	}
-	resp := map[string]any{"id_token": s.sign(claims), "expires_in": int(idTokenTTL.Seconds()), "token_type": "Bearer"}
+	resp := map[string]any{"id_token": s.idToken(naID, clientID, f.Get("nonce")), "expires_in": int(idTokenTTL.Seconds()), "token_type": "Bearer"}
 	if st := f.Get("state"); st != "" {
 		resp["state"] = st
 	}
@@ -501,14 +508,7 @@ func (s *service) linkPage(w http.ResponseWriter, r *http.Request, f url.Values)
 		v.Set("code", code)
 	}
 	if strings.Contains(rt, "id_token") {
-		clientID := f.Get("client_id")
-		now := time.Now().Unix()
-		claims := map[string]any{"aud": clientID, "exp": now + int64(idTokenTTL.Seconds()), "iat": now, "iss": issuer,
-			"jti": newJTI(), "sub": naID, "typ": "id_token"}
-		if n := f.Get("nonce"); n != "" {
-			claims["nonce"] = n
-		}
-		v.Set("id_token", s.sign(claims))
+		v.Set("id_token", s.idToken(naID, f.Get("client_id"), f.Get("nonce")))
 	}
 	if st := f.Get("state"); st != "" {
 		v.Set("state", st)
@@ -539,11 +539,9 @@ func (s *service) sessionToken(w http.ResponseWriter, r *http.Request) {
 
 // tokenSet is what a completed link returns: access, refresh and id tokens for the account.
 func (s *service) tokenSet(w http.ResponseWriter, naID, clientID string) {
-	now := time.Now().Unix()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": s.accessToken(naID, clientID), "refresh_token": s.refreshToken(naID, clientID),
-		"id_token": s.sign(map[string]any{"aud": clientID, "exp": now + int64(idTokenTTL.Seconds()), "iat": now,
-			"iss": issuer, "jti": newJTI(), "sub": naID, "typ": "id_token"}),
+		"id_token":      s.idToken(naID, clientID, ""),
 		"session_token": s.refreshToken(naID, clientID),
 		"expires_in":    int(accessTTL.Seconds()), "scope": accessScopes, "token_type": "Bearer",
 	})
