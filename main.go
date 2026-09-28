@@ -291,7 +291,7 @@ func redact(body string) string {
 	parts := []string{}
 	for k, v := range vals {
 		s := strings.Join(v, ",")
-		if k == "nx_password" {
+		if k == "nx_password" || k == "code" || strings.HasSuffix(k, "code_verifier") || strings.HasPrefix(k, "session_token") {
 			s = "***"
 		} else if strings.Count(s, ".") == 2 && len(s) > 80 {
 			s = fmt.Sprintf("jwt%v", jwtClaims(s))
